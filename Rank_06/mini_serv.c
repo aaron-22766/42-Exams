@@ -2,30 +2,25 @@
 #include <string.h>
 #include <unistd.h>
 #include <netdb.h>
-#include <stdlib.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <limits.h>
 #include <stdio.h>
-#include <stdbool.h>
-#include <fcntl.h>
+#include <stdlib.h>
 
 #define FATAL "Fatal error"
 #define BUFFER_SIZE 1024
 
-void error(const char *message) {
-    write(STDERR_FILENO, message, strlen(message));
+void error(const char *msg) {
+    write(STDERR_FILENO, msg, strlen(msg));
     write(STDERR_FILENO, "\n", 1);
     exit(1);
 }
 
-void fail(fd_set *fds, int fdmax, char **msg) {
+void fail(fd_set *fds, char **msg, int fdmax) {
     for (int i = 0; i <= fdmax; ++i) {
         if (FD_ISSET(i, fds)) {
-            close(i);
             free(msg[i]);
+            close(i);
         }
     }
     error(FATAL);
@@ -87,106 +82,100 @@ char *str_join(char *buf, char *add)
 }
 
 int main(int argc, char **argv) {
-    if (argc <= 1) {
+    if (argc < 2) {
         error("Wrong number of arguments");
     }
 
-	// socket create and verification
-    int server;
-	if ((server = socket(AF_INET, SOCK_STREAM, 0)) == -1) { 
+	struct sockaddr_in servaddr, cli; 
+    socklen_t len = sizeof(cli);
+
+	// socket create and verification 
+	int server = socket(AF_INET, SOCK_STREAM, 0); 
+	if (server == -1) { 
 		error(FATAL);
 	}
 
-	struct sockaddr_in servaddr;
 	bzero(&servaddr, sizeof(servaddr)); 
+	// assign IP, PORT 
 	servaddr.sin_family = AF_INET; 
 	servaddr.sin_addr.s_addr = htonl(2130706433); //127.0.0.1
-	servaddr.sin_port = htons(atoi(argv[1])); 
+	servaddr.sin_port = htons(atoi(argv[1]));
   
 	// Binding newly created socket to given IP and verification 
-	if ((bind(server, (const struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
+	if ((bind(server, (const struct sockaddr *)&servaddr, sizeof(servaddr))) != 0 || listen(server, 10) != 0) {
         close(server);
-		error(FATAL);
-	}
-	if (listen(server, 10) != 0) {
-        close(server);
-		error(FATAL);
-	}
-
-    fcntl(server, F_SETFL, O_NONBLOCK); // TESTING
+        error(FATAL);
+    }
 
     fd_set fds;
-    fd_set read_fds;
+    fd_set events;
     FD_ZERO(&fds);
     FD_SET(server, &fds);
     int fdmax = server;
-    int last_client = -1;
+    int last = -1;
     int ids[FD_SETSIZE] = {-1};
     char *msg[FD_SETSIZE] = {NULL};
     char buf[BUFFER_SIZE];
 
-    while (true) {
-        read_fds = fds;
-        if (select(fdmax + 1, &read_fds, NULL, NULL, NULL) < 0) {
-            fail(&fds, fdmax, msg);
+    while (1) {
+        events = fds;
+        if (select(fdmax + 1, &events, NULL, NULL, NULL) == -1) {
+            fail(&fds, msg, fdmax);
         }
         for (int i = 0; i <= fdmax; ++i) {
-            if (FD_ISSET(i, &read_fds)) {
-                if (i == server) { // new client connection
-                    struct sockaddr_in client_addr;
-                    socklen_t addr_len = sizeof(client_addr);
-                    int client = accept(server, (struct sockaddr *)&client_addr, &addr_len);
-                    if (client > -1) {
+            if (FD_ISSET(i, &events)) {
+                if (i == server) { // new connection
+                    int client = accept(server, (struct sockaddr *)&cli, &len);
+                    if (client >= 0) {
                         FD_SET(client, &fds);
+                        ids[client] = ++last;
                         if (client > fdmax) {
                             fdmax = client;
                         }
-                        ids[client] = ++last_client;
-                        bzero(&buf, BUFFER_SIZE);
-                        sprintf(buf, "server: client %d just arrived\n", ids[client]);
+                        bzero(buf, BUFFER_SIZE);
+                        sprintf(buf, "server: client %d just arrived\n", last);
                         send_message(&fds, server, client, fdmax, buf);
-                        // printf("%s", buf);
                     }
-                } else { // read client
-                    bzero(&buf, BUFFER_SIZE);
-                    ssize_t read_bytes;
-                    if ((read_bytes = recv(i, &buf, BUFFER_SIZE - 1, 0)) == 0) {
+                } else { // client event
+                    ssize_t ret;
+                    bzero(buf, BUFFER_SIZE);
+                    if ((ret = recv(i, buf, BUFFER_SIZE - 1, 0)) == 0) {
                         // client closed connection
                         FD_CLR(i, &fds);
                         close(i);
-                        if (ids[i] == last_client) {
-                            last_client--;
-                        }
-                        bzero(&buf, BUFFER_SIZE);
-                        sprintf(buf, "server: client %d just left\n", ids[i]);send_message(&fds, server, i, fdmax, buf);
-                        // printf("%s", buf);
-                        ids[i] = -1;
                         free(msg[i]);
                         msg[i] = NULL;
-                    } else if (read_bytes > 0) {
-                        // printf("reading from client\n");
-                        if ((msg[i] = str_join(msg[i], buf)) == NULL) {
-                            fail(&fds, fdmax, msg);
+                        if (i == fdmax) {
+                            --fdmax;
+                        }
+                        bzero(buf, BUFFER_SIZE);
+                        sprintf(buf, "server: client %d just left\n", ids[i]);
+                        ids[i] = -1;
+                        send_message(&fds, server, i, fdmax, buf);
+                    } else if (ret > 0) { // client read send
+                        msg[i] = str_join(msg[i], buf);
+                        if (msg[i] == NULL) {
+                            fail(&fds, msg, fdmax);
                         }
                         char *line = NULL;
-                        int res;
-                        while ((res = extract_message(&msg[i], &line)) > 0) {
-                            char *temp = calloc(15 + BUFFER_SIZE, sizeof(char));
+                        while ((ret = extract_message(&msg[i], &line)) > 0) {
+                            char *temp = calloc(30, sizeof(char));
                             if (temp == NULL) {
                                 free(line);
-                                fail(&fds, fdmax, msg);
+                                fail(&fds, msg, fdmax);    
                             }
                             sprintf(temp, "client %d: ", ids[i]);
                             temp = str_join(temp, line);
                             free(line);
                             if (temp == NULL) {
-                                fail(&fds, fdmax, msg);
+                                fail(&fds, msg, fdmax);
                             }
+                            line = NULL;
                             send_message(&fds, server, i, fdmax, temp);
-                            // printf("%s", temp);
+                            free(temp);
                         }
-                        if (res == -1) {
-                            fail(&fds, fdmax, msg);
+                        if (ret == -1) {
+                            fail(&fds, msg, fdmax);
                         }
                     }
                 }
